@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+
+import os, os.path, sys, time, string, random
+import argparse, ConfigParser, subprocess, shlex, snakebite
+from snakebite.client import Client
+import snakebite.errors
+
+from pkg_resources import resource_string
+
+try:
+    import simplejson as json
+except:
+    import json
+
+def calc_hdfs_time_offset():
+    while True:
+        random_str = ''.join(random.choice(string.ascii_lowercase + 
+                string.ascii_uppercase + string.digits) for _ in range(20))
+        try:
+            next(hdfs_client.ls([random_str]))
+            continue
+        except snakebite.errors.FileNotFoundException:
+            break
+    next(hdfs_client.touchz([random_str]))
+    cur_time = int(time.time())
+    mod_time = next(hdfs_client.ls([random_str]))['modification_time']/1000.0
+    next(hdfs_client.delete([random_str]))
+    offset = cur_time - mod_time
+    if abs(offset) > 1: 
+        return offset
+    else:
+        return 0
+
+def calc_fsys_time_offset():
+    while True:
+        random_str = ''.join(random.choice(string.ascii_lowercase + 
+                string.ascii_uppercase + string.digits) for _ in range(20))
+        if os.path.exists(random_str):
+            continue
+        else:
+            break
+    open(random_str, "w").close()
+    cur_time = int(time.time())
+    mod_time = os.path.getmtime(random_str)
+    os.remove(random_str)
+    offset = cur_time - mod_time
+    if abs(offset) > 1:
+        return offset
+    else:
+        return 0
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("job_conf", help="Job configuration JSON file")
+    parser.add_argument("--input", help="Add/override first input argument",
+                        action="append")
+    parser.add_argument("--output", help="Add/override last output argument")
+    parser.add_argument("--project", help="Add/override project name")
+    parser.add_argument("--jobname", help="Add/override job name")
+    parser.add_argument("--stop", 
+            help="Stop after running job # STOP (zero-based index)", default=-1)
+    args = parser.parse_args()
+    return args
+
+def load_conf():
+    conf_file = os.path.join(os.path.expanduser("~"), ".aquaflows.ini")
+    if not os.path.isfile(conf_file):
+        return None
+    config = ConfigParser.ConfigParser()
+    config.read(conf_file)
+    for section in config.sections():
+        for option in config.options(section):
+            config.set(section, option, 
+                        os.path.expandvars(config.get(section, option)))
+    return config
+
+class ScriptJob:
+    def __init__(self, job):
+        self.job = job
+        self.inputs = job['inputs']
+        self.output = job['output']
+        self.script = job['script']
+        self.opts = job.get('opts', {})
+        self.run()
+
+    def run(self):
+        self._check_script()
+        self._expand_filenames()
+        if not self._should_run():
+            print "Skipping", self.script
+            return
+        self._construct_cmd()
+        print "Running command:", self.cmd
+        p = subprocess.Popen(self.cmd_args)#, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.wait()
+        if p.returncode != 0:
+            print "Job failed (script:",self.script, "returncode:",str(p.returncode)+")"
+            try:
+                deleted = list(hdfs_client.delete([self.output], recurse=True))
+            except snakebite.errors.FileNotFoundException:
+                pass
+            sys.exit(-1)
+    
+    def _check_script(self):
+        if not os.path.isfile(self.script):
+            print("Script "+self.script+" does not exist!")
+            sys.exit(-1)
+
+    def _expand_filenames(self):
+        global path_prefix
+        for index in range(len(self.inputs)):
+            self.inputs[index] = os.path.expandvars(self.inputs[index])
+            if self.inputs[index].startswith("/"): continue
+            self.inputs[index] = os.path.join(path_prefix, self.inputs[index])
+        self.output = os.path.expandvars(self.output)
+        if not self.output.startswith("/"):
+            self.output = os.path.join(path_prefix, self.output)
+    
+    def _should_run(self):
+        global hdfs_time_offset, fsys_time_offset
+        latest = None
+        for input_stat in hdfs_client.ls(self.inputs):
+            if latest == None or input_stat['modification_time'] > latest:
+                latest = input_stat['modification_time']
+        # if the input/output names are changed, latest can end up being None
+        # TODO: fix this behavior
+        if latest == None:
+            print >> sys.stderr, "Error! Latest file had no timestamp. Does it exist?"
+        input_mtime = latest/1000.0 + hdfs_time_offset
+        # I'm debating whether or not I want the file modification time 
+        # to affect whether or not the job runs. Currently disabled
+        script_mtime = os.path.getmtime(self.script) + fsys_time_offset
+        #script_mtime = -1
+        try:
+            output_mtime = hdfs_client.stat([self.output])['modification_time']/1000.0 + hdfs_time_offset
+        except snakebite.errors.FileNotFoundException:
+            output_mtime = 0
+        if input_mtime > output_mtime or script_mtime > output_mtime:
+            # Either the inputs or the script was modified since the output
+            # was last generated or the output does not exist. 
+            # If the output exists, delete it. Then run the task.
+            if output_mtime > 0:
+                deleted = list(hdfs_client.delete([self.output], recurse=True))
+            return True
+        else:
+            return False
+
+    def _construct_cmd(self):
+        global dumbo_opts
+        self.cmd = "dumbo start "
+        self.cmd += " ".join([self.script])
+        for input in self.inputs:
+            self.cmd += " -input " + input + " "
+        self.cmd += " -output " + self.output + " " 
+        for opt in self.opts:
+            self.cmd += "-"+opt + " " + os.path.expandvars(self.opts[opt])
+        self.cmd += dumbo_opts
+        self.cmd_args = shlex.split(self.cmd)
+
+
+    def _cleanup(self):
+        pass
+
+class FlowJob:
+    def __init__(self, flow, indents=1):
+        self.flow = flow
+        self.indents = indents
+        self.flow_filename = flow['flow']
+        self.flow_file = resource_string("aquaflows.flows",self.flow_filename)
+        try:
+            self.batch_description = json.loads(self.flow_file)
+        except Exception, e:
+            print "Problem loading JSON job description file:", self.flow_filename
+            print "\tCause:",e
+            sys.exit(-1)
+        self._save_and_update_state()
+        self.run()
+        self._load_saved_state()
+
+    def _save_and_update_state(self):
+        self._old_vars = os.environ.copy()
+        self._old_dir = os.getcwd()
+        os.chdir(os.path.dirname(os.path.join(
+            os.path.dirname(__file__), "../flows", self.flow_filename)))
+        if 'env' in self.flow:
+            for env_var in self.flow['env']:
+                var_name, value = env_var.split("=",1)
+                os.environ[var_name] = value
+
+    def _load_saved_state(self):
+        os.environ = self._old_vars
+        os.chdir(self._old_dir)
+
+
+    def run(self):
+        print "Running flow", self.flow_filename
+        # Loop through jobs, run either "script" tasks or "flow" tasks
+        for index, job in enumerate(self.batch_description['jobs']):
+            print " "*4*self.indents + "Job",str(index)+":",
+            if "script" in job:
+                ScriptJob(job)
+            if "flow" in job:
+                FlowJob(job, self.indents+1)
+
+
+if __name__ == "__main__":
+    # Parse the arguments to this instance of flow
+    args = parse_args()
+    # Load the aquaflows configuration file (stored in ~/aquaflows.ini)
+    config = load_conf()
+
+    hdfs_client = snakebite.client.Client(config.get('ClusterConfig', 'hdfsserver'))
+    
+    # Check for timestamp issues on HDFS and the local filesystem 
+    hdfs_time_offset = calc_hdfs_time_offset()
+    fsys_time_offset = calc_fsys_time_offset()
+    
+    # Prepare the dumbo opts string (appended to each job)
+    dumbo_opts = " "+ " ".join(["-"+ opt + ' ' + val 
+                                 for opt, val in config.items('JobOpts')])
+    
+    # Open the flow config that was passed in (a JSON file)
+    try:
+        f = open(args.job_conf, "r")
+        batch_description = json.loads(f.read())
+    except Exception, e:
+        print "Problem loading JSON job description file:", args.job_conf
+        print "\tCause:",e
+        sys.exit(-1)
+    
+    # Prepend the HDFS path based using arguments from the commnad line, 
+    # then use settings from the specified flow file
+    path_prefix = ""
+    if args.project is not None:
+        path_prefix = os.path.join(path_prefix, args.project)
+    elif 'project' in batch_description:
+        path_prefix = os.path.join(path_prefix, batch_description['project'])
+    if args.jobname is not None:
+        path_prefix = os.path.join(path_prefix, args.jobname)
+    elif 'jobname' in batch_description:
+        path_prefix = os.path.join(path_prefix, batch_description['jobname'])
+    
+    # Override input/output locations if specified
+    if args.output is not None:
+        batch_description['jobs'][-1]['output'] = args.output
+    if args.input is not None:
+        batch_description['jobs'][0]['inputs'] = args.input
+
+    # Loop through jobs, run either "script" tasks or "flow" tasks
+    for index, job in enumerate(batch_description['jobs']):
+        print "Job",str(index)+":",
+        if "script" in job:
+            ScriptJob(job)
+        if "flow" in job:
+            FlowJob(job)
+        if index == int(args.stop):
+            break
+
+    # Run these scripts after everything else. 
+    # WARNING: May be deprecated in the future
+    if 'post' in batch_description:
+        for index, task in enumerate(batch_description['post']):
+            print "Running post task:", task
+            cmd_args = shlex.split(task)
+            p = subprocess.Popen(cmd_args)
+            p.wait()
